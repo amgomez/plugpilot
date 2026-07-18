@@ -1,0 +1,47 @@
+/* Power status (informational item, tag 100) */
+"status.checking" = "Checking…";
+"status.onAC" = "Charger connected";
+"status.onBattery" = "On battery";
+"status.acOnly" = "AC power";
+
+/* Icon accessibility descriptions */
+"accessibility.power" = "Power";
+"accessibility.battery" = "Battery";
+"accessibility.fans" = "Fans";
+
+/* Initial placeholders for informational items */
+"cpu.temperature.placeholder" = "Temperature: —";
+"battery.temperature.placeholder" = "Battery: —";
+"fans.placeholder" = "Fans: —";
+
+/* Automations section */
+"menu.bluetoothPolicy" = "Bluetooth only on charger";
+"menu.wifiPolicy" = "Wi-Fi only without Ethernet";
+"fanIntensity.off" = "Default";
+"fanIntensity.soft" = "Soft (25%)";
+"fanIntensity.medium" = "Medium (33%)";
+"fanIntensity.strong" = "Strong (50%)";
+"fanIntensity.extreme" = "Extreme (75%)";
+
+/* General menu items */
+"menu.loginItem" = "Start automatically at login";
+"menu.quit" = "Quit";
+
+/* Aggressive fans: intensity submenu title by state */
+"fans.aggressive.title" = "Fan intensity (only on charger)";
+"fans.aggressive.title.pendingApproval" = "Fan intensity (only on charger) ⚠️ pending approval in Settings";
+"fans.aggressive.title.thermalPause" = "Fan intensity (only on charger, paused: thermal load)";
+
+/* Temperature and fan readings */
+"cpu.temperature.format" = "CPU: %.1f°C";
+"cpu.temperature.unavailable" = "CPU: not available";
+"battery.temperature.format" = "Battery: %.1f°C";
+"battery.temperature.unavailable" = "Battery: not available";
+"fans.unavailable" = "Fans: not available";
+"fan.reading.unavailable.format" = "Fan %d: —";
+"fan.reading.format" = "Fan %d: %d rpm (%d%%)";
+
+/* Bluetooth and Wi-Fi/Ethernet status */
+"bluetooth.status.format" = "Bluetooth: %@";
+"wifi.status.format" = "Wi-Fi: %@";
+"wifi.status.ethernet.suffix" = " Ethernet";

@@ -1,0 +1,47 @@
+/* Estado de alimentación (ítem informativo, tag 100) */
+"status.checking" = "Comprobando…";
+"status.onAC" = "Cargador conectado";
+"status.onBattery" = "En batería";
+"status.acOnly" = "Con corriente";
+
+/* Descripciones de accesibilidad de iconos */
+"accessibility.power" = "Alimentación";
+"accessibility.battery" = "Batería";
+"accessibility.fans" = "Ventiladores";
+
+/* Placeholders iniciales de los ítems informativos */
+"cpu.temperature.placeholder" = "Temperatura: —";
+"battery.temperature.placeholder" = "Batería: —";
+"fans.placeholder" = "Ventiladores: —";
+
+/* Sección de automatizaciones */
+"menu.bluetoothPolicy" = "Bluetooth solo con cargador";
+"menu.wifiPolicy" = "Wi-Fi solo sin Ethernet";
+"fanIntensity.off" = "Por defecto";
+"fanIntensity.soft" = "Suave (25 %)";
+"fanIntensity.medium" = "Media (33 %)";
+"fanIntensity.strong" = "Fuerte (50 %)";
+"fanIntensity.extreme" = "Extremo (75 %)";
+
+/* Ítems generales del menú */
+"menu.loginItem" = "Abrir automáticamente al iniciar sesión";
+"menu.quit" = "Salir";
+
+/* Ventiladores agresivos: título del submenú de intensidad según estado */
+"fans.aggressive.title" = "Intensidad de ventiladores (solo con cargador)";
+"fans.aggressive.title.pendingApproval" = "Intensidad de ventiladores (solo con cargador) ⚠️ pendiente de aprobar en Ajustes";
+"fans.aggressive.title.thermalPause" = "Intensidad de ventiladores (solo con cargador, en pausa: carga térmica)";
+
+/* Lecturas de temperatura y ventiladores */
+"cpu.temperature.format" = "CPU: %.1f°C";
+"cpu.temperature.unavailable" = "CPU: no disponible";
+"battery.temperature.format" = "Batería: %.1f°C";
+"battery.temperature.unavailable" = "Batería: no disponible";
+"fans.unavailable" = "Ventiladores: no disponibles";
+"fan.reading.unavailable.format" = "Ventilador %d: —";
+"fan.reading.format" = "Ventilador %d: %d rpm (%d%%)";
+
+/* Estado de Bluetooth y Wi-Fi/Ethernet */
+"bluetooth.status.format" = "Bluetooth: %@";
+"wifi.status.format" = "Wi-Fi: %@";
+"wifi.status.ethernet.suffix" = " Ethernet";

@@ -1,0 +1,7 @@
+.build/
+.DS_Store
+BatteryBluetoothToggle.app/
+PlugPilot.app/
+PlugPilot-*.zip
+# Imagen fuente del icono generada por IA; el artefacto usable ya está en Resources/AppIcon.icns
+ChatGPT Image*.png
