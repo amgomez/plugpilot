@@ -4,7 +4,7 @@ Una app de barra de menús para macOS que automatiza radios y ventiladores
 según la fuente de alimentación, en Mac Intel genéricos.
 *(Read this in [English](README.md).)*
 
-<!-- TODO: añadir aquí una captura del menú abierto, p. ej. ![Menú de PlugPilot](docs/menu.png) -->
+![Menú de PlugPilot](docs/menu.png)
 
 ## Qué hace
 

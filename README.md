@@ -3,7 +3,7 @@
 A macOS menu-bar app that automates radios and fans based on power source, on
 generic Intel Macs. *(Lea esto en [español](README.es.md).)*
 
-<!-- TODO: add a screenshot of the open menu here, e.g. ![PlugPilot menu](docs/menu.png) -->
+![PlugPilot menu](docs/menu.png)
 
 ## What it does
 
