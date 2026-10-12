@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "shim.h"
 
 // Daemon root mínimo para PlugPilot. El SMC solo acepta escrituras desde
@@ -16,6 +17,12 @@
 // se pueden leer no se escribe nada.
 
 #define SERVICE_NAME "com.amgg.plugpilot.helper"
+
+// Margen de verificación del objetivo: 8 intentos de 100 ms. El retraso medido
+// de la lectura ronda los 200 ms, así que 800 ms dejan holgura de sobra sin que
+// una petición pueda bloquear al helper durante segundos.
+#define VERIFY_ATTEMPTS 8
+#define VERIFY_STEP_NS 100000000L
 
 // El helper se lanza bajo demanda (launchd, MachServices) y sale solo tras unos
 // segundos sin peticiones, para no dejar un proceso root residente.
@@ -50,10 +57,14 @@ static void handleRequest(xpc_object_t event) {
                 // puede ser peligroso térmicamente, así que sin poder leerlo no se escribe.
                 status = -3;
             } else {
-                if (rpm < factoryMin) {
+                // Comparaciones negadas a propósito: con rpm = NaN las dos formas
+                // directas (rpm < min, rpm > max) son falsas y el NaN llegaba entero al
+                // SMC. El servicio Mach es alcanzable por cualquier proceso local, así
+                // que la acotación tiene que aguantar una petición malintencionada.
+                if (!(rpm >= factoryMin)) {
                     rpm = factoryMin;
                 }
-                if (rpm > factoryMax) {
+                if (!(rpm <= factoryMax)) {
                     rpm = factoryMax;
                 }
                 // Primero el modo y después el objetivo: en modo auto el SMC reescribe
@@ -61,25 +72,45 @@ static void handleRequest(xpc_object_t event) {
                 // de alimentación), y pisaba nuestra escritura antes de que llegara el
                 // forzado. Congelar primero es inocuo: el objetivo vigente es el que auto
                 // ya aplicaba.
-                status = SMCWriteFanMode((int)fan, 1);
+                int forced = SMCWriteFanMode((int)fan, 1);
+                status = forced;
                 if (status == 0) {
                     status = SMCWriteFanTargetRPM((int)fan, (float)rpm);
                 }
                 if (status == 0) {
-                    // Relectura de verificación con un reintento, por si quedaba una
-                    // escritura del SMC en vuelo.
+                    // La lectura del SMC va retrasada respecto a la escritura: medido en
+                    // este Mac, un F#Tg escrito en t=0 no se lee con el valor nuevo hasta
+                    // t=+0,18 s (y F#Md tarda todavía más). Releer de inmediato devolvía
+                    // siempre el valor anterior, así que la verificación fallaba SIEMPRE
+                    // que el objetivo cambiaba de verdad y el ventilador volvía a auto
+                    // justo después de haber acelerado. Por eso se espera entre intentos
+                    // en vez de releer al momento.
                     char key[5];
                     snprintf(key, sizeof(key), "F%dTg", (int)fan);
-                    double applied = SMCGetFloatValue(key);
-                    if (applied < rpm - 1.0 || applied > rpm + 1.0) {
-                        status = SMCWriteFanTargetRPM((int)fan, (float)rpm);
-                        if (status == 0) {
-                            applied = SMCGetFloatValue(key);
-                            if (applied < rpm - 1.0 || applied > rpm + 1.0) {
-                                status = -2;
-                            }
+                    status = -2;
+                    for (int attempt = 0; attempt < VERIFY_ATTEMPTS; attempt++) {
+                        struct timespec pause = {0, VERIFY_STEP_NS};
+                        nanosleep(&pause, NULL);
+                        double applied = SMCGetFloatValue(key);
+                        if (applied >= rpm - 1.0 && applied <= rpm + 1.0) {
+                            status = 0;
+                            break;
+                        }
+                        // A mitad del margen, un reintento de escritura por si la primera
+                        // se cruzó con una reescritura del SMC en vuelo.
+                        if (attempt == VERIFY_ATTEMPTS / 2 && SMCWriteFanTargetRPM((int)fan, (float)rpm) != 0) {
+                            status = -1;
+                            break;
                         }
                     }
+                }
+                if (forced == 0 && status != 0) {
+                    // Congelado pero sin un objetivo que podamos dar por bueno: es peor
+                    // que no haber tocado nada, porque en modo forzado el SMC ya no sube
+                    // las RPM al calentarse. Se devuelve el control y se responde el error
+                    // original. Ocurre, por ejemplo, en los Intel donde F#Tg es fpe2 y no
+                    // flt: la escritura del modo entra y la del objetivo no.
+                    SMCWriteFanMode((int)fan, 0);
                 }
             }
         } else if (mode == 0) {

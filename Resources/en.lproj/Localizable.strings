@@ -23,6 +23,19 @@
 "fanIntensity.strong" = "Strong (50%)";
 "fanIntensity.extreme" = "Extreme (75%)";
 
+/* Keep awake */
+"keepAwake.title" = "Keep awake";
+"keepAwake.title.indefinite" = "Keep awake: indefinitely";
+"keepAwake.title.until.format" = "Keep awake: until %@";
+"keepAwake.title.until.singular.format" = "Keep awake: until %@";
+"keepAwake.off" = "Off";
+"keepAwake.indefinite" = "Indefinitely";
+"keepAwake.minutes.format" = "%d minutes";
+"keepAwake.hour" = "1 hour";
+"keepAwake.hours.format" = "%d hours";
+"keepAwake.allowDisplaySleep" = "Allow display sleep";
+"accessibility.keepAwake" = "PlugPilot, keeping the Mac awake";
+
 /* General menu items */
 "menu.loginItem" = "Start automatically at login";
 "menu.quit" = "Quit";

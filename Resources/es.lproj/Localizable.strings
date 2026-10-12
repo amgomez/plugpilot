@@ -23,6 +23,19 @@
 "fanIntensity.strong" = "Fuerte (50 %)";
 "fanIntensity.extreme" = "Extremo (75 %)";
 
+/* Evitar el reposo */
+"keepAwake.title" = "Evitar el reposo";
+"keepAwake.title.indefinite" = "Evitar el reposo: indefinidamente";
+"keepAwake.title.until.format" = "Evitar el reposo: hasta las %@";
+"keepAwake.title.until.singular.format" = "Evitar el reposo: hasta la %@";
+"keepAwake.off" = "Desactivado";
+"keepAwake.indefinite" = "Indefinidamente";
+"keepAwake.minutes.format" = "%d minutos";
+"keepAwake.hour" = "1 hora";
+"keepAwake.hours.format" = "%d horas";
+"keepAwake.allowDisplaySleep" = "Permitir que se apague la pantalla";
+"accessibility.keepAwake" = "PlugPilot, evitando el reposo";
+
 /* Ítems generales del menú */
 "menu.loginItem" = "Abrir automáticamente al iniciar sesión";
 "menu.quit" = "Salir";

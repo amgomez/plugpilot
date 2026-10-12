@@ -1,5 +1,5 @@
-#ifndef BBT_SHIM_H
-#define BBT_SHIM_H
+#ifndef PLUGPILOT_SHIM_H
+#define PLUGPILOT_SHIM_H
 
 #include <IOKit/ps/IOPowerSources.h>
 #include <IOKit/IOKitLib.h>

@@ -36,6 +36,17 @@ Every automation degrades gracefully: on machines without fans, a battery,
 or Wi-Fi hardware, the corresponding menu items are hidden automatically
 (capabilities are detected once at launch).
 
+PlugPilot also has a manual **Keep awake** submenu, similar to Amphetamine
+or `caffeinate`. It keeps the Mac from going to sleep, either indefinitely or
+for 15 minutes to 8 hours, and the display stays on unless you tick "Allow
+display sleep". The menu-bar icon is filled while a session is active. It
+uses a standard power-management assertion (the same one `caffeinate`
+creates), so it costs nothing while active, and macOS releases it
+automatically if PlugPilot quits or crashes. With the lid closed, the Mac
+only stays awake in closed-display (clamshell) mode, with an external display
+and power connected, as usual; PlugPilot does not change that. Sessions are
+not kept when PlugPilot restarts.
+
 ## Requirements
 
 - macOS 13 (Ventura) or later.

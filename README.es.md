@@ -39,6 +39,18 @@ sin batería o sin hardware Wi-Fi, los ítems de menú correspondientes se
 ocultan automáticamente (las capacidades se detectan una sola vez, en el
 arranque).
 
+PlugPilot tiene además un submenú manual, **Evitar el reposo**, parecido a
+Amphetamine o a `caffeinate`. Impide que el Mac entre en reposo, sin límite
+o durante un tiempo de entre 15 minutos y 8 horas, y la pantalla sigue
+encendida salvo que se marque "Permitir que se apague la pantalla". Mientras
+hay una sesión activa, el icono de la barra se ve relleno. Usa una aserción
+estándar de gestión de energía (la misma que crea `caffeinate`), así que no
+consume nada mientras está activa, y macOS la retira sola si PlugPilot se
+cierra o falla. Con la tapa cerrada, el Mac sólo sigue despierto en modo
+clamshell, con un monitor externo y el cargador conectados, como siempre;
+PlugPilot no cambia eso. Las sesiones no se conservan al reiniciar
+PlugPilot.
+
 ## Requisitos
 
 - macOS 13 (Ventura) o posterior.

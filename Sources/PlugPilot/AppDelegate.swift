@@ -3,6 +3,7 @@ import CShim
 import ServiceManagement
 import CoreWLAN
 import SystemConfiguration
+import IOKit.pwr_mgt
 import XPC
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -11,6 +12,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var dynamicStore: SCDynamicStore?
     private var lastOnACPower = true
     private var lastEthernetActive = false
+    // Con el menú cerrado no se pinta nada: menuWillOpen lo refresca todo antes de
+    // mostrarlo, así que un evento en segundo plano solo hace el trabajo de su política.
+    private var menuIsOpen = false
+    // Clave de enlace de la propia Wi-Fi en configd: sus eventos no cambian el estado de
+    // Ethernet y se descartan sin más (incluidos los que provoca la propia política).
+    private var wifiLinkKey: String?
+
+    // Evitar el reposo: una aserción de gestión de energía, la misma que crea `caffeinate`
+    // por dentro pero sin un proceso aparte. Mientras existe no cuesta nada, y powerd la
+    // suelta sola si la app muere, así que un cierre anómalo nunca deja al Mac sin dormir.
+    // Las sesiones son manuales y no sobreviven a un reinicio de la app.
+    private var sleepAssertionID = IOPMAssertionID(0)
+    private var keepAwakeActive = false
+    private var keepAwakeMinutes = 0  // 0 = indefinido
+    private var keepAwakeUntil: Date?
+    private var keepAwakeTimer: DispatchSourceTimer?
+    private static let keepAwakeDurations = [15, 30, 60, 120, 240, 480]
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        return formatter
+    }()
 
     // Número de ventiladores de esta máquina, detectado en el arranque vía SMC (FNum):
     // no hay tabla fija, cada Mac tiene su propio hardware. En muchos firmwares Intel el
@@ -26,6 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hasFans = false
     private var hasBattery = false
     private var hasWiFi = false
+    private var hasBluetooth = false
     private var hasCPUTemperature = false
     private var hasBatteryTemperature = false
 
@@ -34,6 +59,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let helperPlistName = "com.amgg.plugpilot.helper.plist"
     private static let helperServiceName = "com.amgg.plugpilot.helper"
     private var helperConnection: xpc_connection_t?
+    // Identifica a la conexión cacheada: tras cancelarla, XPC entrega todavía un último
+    // XPC_ERROR_CONNECTION_INVALID a su handler, y sin este contador ese error tardío
+    // descartaría la conexión siguiente, que está sana.
+    private var helperConnectionGeneration = 0
     private var pendingFanVerification = 0
     // Solo hay que restaurar los mínimos de fábrica si llegamos a aplicar los agresivos:
     // evita lanzar el helper root cuando la función no se usa.
@@ -63,6 +92,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set { UserDefaults.standard.set(newValue, forKey: Self.fanIntensityDefaultsKey) }
     }
 
+    private static let keepAwakeDisplaySleepDefaultsKey = "keepAwakeAllowsDisplaySleep"
+    private var keepAwakeAllowsDisplaySleep: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.keepAwakeDisplaySleepDefaultsKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.keepAwakeDisplaySleepDefaultsKey) }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
@@ -73,7 +108,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Self.bluetoothPolicyDefaultsKey: false,
             Self.wifiPolicyDefaultsKey: false,
             Self.aggressiveFansDefaultsKey: false,
-            Self.fanIntensityDefaultsKey: 33
+            Self.fanIntensityDefaultsKey: 33,
+            Self.keepAwakeDisplaySleepDefaultsKey: false
         ])
 
         // Las claves SMC de una máquina no cambian en caliente: basta con leer FNum una
@@ -81,12 +117,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         fanCount = Int(SMCGetFanCount())
         hasFans = fanCount > 0
         hasBattery = detectHasBattery()
-        hasWiFi = CWWiFiClient.shared().interface() != nil
+        let wifiInterface = CWWiFiClient.shared().interface()
+        hasWiFi = wifiInterface != nil
+        wifiLinkKey = wifiInterface?.interfaceName.map { "State:/Network/Interface/\($0)/Link" }
+        hasBluetooth = detectHasBluetooth()
         hasCPUTemperature = readTemperature(candidateKeys: Self.cpuTemperatureKeys) != nil
         hasBatteryTemperature = hasBattery && readTemperature(candidateKeys: Self.batteryTemperatureKeys) != nil
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "bolt.horizontal.circle", accessibilityDescription: "PlugPilot")
+        updateStatusItemIcon()
 
         let menu = NSMenu()
 
@@ -102,6 +141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             logo.size = NSSize(width: 16, height: 16)
             bluetoothMenuItem.image = logo
         }
+        bluetoothMenuItem.isHidden = !hasBluetooth
         menu.addItem(bluetoothMenuItem)
 
         let networkMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -130,13 +170,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(fanMenuItem)
         menu.addItem(.separator())
 
+        // Evitar el reposo, como Amphetamine: sesión indefinida o con duración, y la
+        // pantalla encendida salvo que se permita apagarla. Va primero entre las acciones
+        // porque es la que se usa a mano; las automatizaciones se tocan una vez y ya.
+        let keepAwakeMenu = NSMenu()
+        let keepAwakeOffItem = NSMenuItem(title: NSLocalizedString("keepAwake.off", comment: "Evitar el reposo: desactivado"), action: #selector(selectKeepAwake(_:)), keyEquivalent: "")
+        keepAwakeOffItem.tag = -1
+        keepAwakeOffItem.target = self
+        keepAwakeMenu.addItem(keepAwakeOffItem)
+        let keepAwakeIndefiniteItem = NSMenuItem(title: NSLocalizedString("keepAwake.indefinite", comment: "Evitar el reposo: sin límite de tiempo"), action: #selector(selectKeepAwake(_:)), keyEquivalent: "")
+        keepAwakeIndefiniteItem.tag = 0
+        keepAwakeIndefiniteItem.target = self
+        keepAwakeMenu.addItem(keepAwakeIndefiniteItem)
+        for minutes in Self.keepAwakeDurations {
+            let item = NSMenuItem(title: keepAwakeDurationTitle(minutes: minutes), action: #selector(selectKeepAwake(_:)), keyEquivalent: "")
+            item.tag = minutes
+            item.target = self
+            keepAwakeMenu.addItem(item)
+        }
+        keepAwakeMenu.addItem(.separator())
+        let displaySleepItem = NSMenuItem(title: NSLocalizedString("keepAwake.allowDisplaySleep", comment: "Checkbox: dejar que la pantalla se apague mientras se evita el reposo"), action: #selector(toggleKeepAwakeDisplaySleep(_:)), keyEquivalent: "")
+        displaySleepItem.tag = -2
+        displaySleepItem.target = self
+        keepAwakeMenu.addItem(displaySleepItem)
+        let keepAwakeItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        keepAwakeItem.tag = 109
+        keepAwakeItem.submenu = keepAwakeMenu
+        menu.addItem(keepAwakeItem)
+        menu.addItem(.separator())
+
         let bluetoothPolicyItem = NSMenuItem(title: NSLocalizedString("menu.bluetoothPolicy", comment: "Checkbox: Bluetooth solo con cargador"), action: #selector(toggleBluetoothPolicy(_:)), keyEquivalent: "")
         bluetoothPolicyItem.tag = 107
         bluetoothPolicyItem.target = self
         bluetoothPolicyItem.state = bluetoothPolicyEnabled ? .on : .off
         // Sin batería siempre hay corriente: la política "solo con cargador" no haría
-        // nunca nada.
-        bluetoothPolicyItem.isHidden = !hasBattery
+        // nunca nada. Sin controlador Bluetooth, tampoco.
+        bluetoothPolicyItem.isHidden = !hasBattery || !hasBluetooth
         menu.addItem(bluetoothPolicyItem)
 
         let wifiPolicyItem = NSMenuItem(title: NSLocalizedString("menu.wifiPolicy", comment: "Checkbox: Wi-Fi solo sin Ethernet"), action: #selector(toggleWiFiPolicy(_:)), keyEquivalent: "")
@@ -181,11 +250,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.delegate = self
         statusItem.menu = menu
+        updateKeepAwakeMenuItem()
 
         // Las suscripciones se registran ANTES de leer el estado inicial: una transición
         // que ocurra entre la lectura y el registro se perdería para siempre.
+        // Solo los paso de cargador a batería y vuelta (kIOPSNotifyPowerSource), que es
+        // lo único que usa la app. IOPSNotificationCreateRunLoopSource avisa además de
+        // cada cambio de porcentaje y de tiempo restante, y en batería o cargando
+        // despertaba a la app a menudo para nada (lo advierte la propia cabecera de IOKit).
         let context = Unmanaged.passUnretained(self).toOpaque()
-        runLoopSource = IOPSNotificationCreateRunLoopSource({ context in
+        runLoopSource = IOPSCreateLimitedPowerNotification({ context in
             let me = Unmanaged<AppDelegate>.fromOpaque(context!).takeUnretainedValue()
             me.powerSourceChanged()
         }, context)?.takeRetainedValue()
@@ -194,6 +268,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // .commonModes: con .defaultMode la notificación no se entrega mientras un
             // menú está abierto (el run loop pasa a modo de event tracking).
             CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        } else {
+            NSLog("No se pudo suscribir a los cambios de fuente de alimentación")
         }
 
         startEthernetLinkMonitoring()
@@ -232,6 +308,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         // Síncrono: un mensaje XPC asíncrono podría no llegar a enviarse antes de morir.
         applyFanPolicy(onAC: false, synchronous: true)
+        // powerd la soltaría igual al morir el proceso; así queda explícito.
+        releaseSleepAssertion()
     }
 
     @objc private func systemDidWake() {
@@ -259,6 +337,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return !sources.isEmpty
     }
 
+    // Un Mac sin controlador Bluetooth no necesita ni el ítem de estado ni la política.
+    // La comprobación es deliberadamente conservadora, porque el coste de equivocarse es
+    // asimétrico: esconder una función que sí existe es peor que enseñar una fila inerte.
+    // Si el controlador responde encendido hay hardware, sea cual sea su clase; y
+    // IOServiceMatching casa también con las subclases de IOBluetoothHCIController.
+    private func detectHasBluetooth() -> Bool {
+        if IOBluetoothPreferenceGetControllerPowerState() != 0 { return true }
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault,
+                                           IOServiceMatching("IOBluetoothHCIController"),
+                                           &iterator) == KERN_SUCCESS else { return true }
+        defer { IOObjectRelease(iterator) }
+        let controller = IOIteratorNext(iterator)
+        guard controller != IO_OBJECT_NULL else { return false }
+        IOObjectRelease(controller)
+        return true
+    }
+
     private func powerSourceChanged() {
         let onAC = isOnACPower()
         guard onAC != lastOnACPower else { return }
@@ -278,6 +374,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Sustituye al antiguo chequeo único con retardo fijo de 2 s: un dock puede tardar
     // más en levantar la interfaz Ethernet, y aquí configd nos avisa justo cuando el
     // enlace sube o baja, sin consumir nada mientras tanto.
+    // Solo interfaces en*, que es el prefijo de toda interfaz Ethernet en macOS. Con .*
+    // llegaban también los vaivenes de awdl0, llw0 y los utun de las VPN, y cada uno
+    // costaba un SCNetworkInterfaceCopyAll más el recorrido del IORegistry.
     private func startEthernetLinkMonitoring() {
         var context = SCDynamicStoreContext(
             version: 0,
@@ -286,12 +385,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             release: nil,
             copyDescription: nil
         )
-        guard let store = SCDynamicStoreCreate(nil, "PlugPilot" as CFString, { _, _, info in
+        guard let store = SCDynamicStoreCreate(nil, "PlugPilot" as CFString, { _, changedKeys, info in
             guard let info else { return }
             let me = Unmanaged<AppDelegate>.fromOpaque(info).takeUnretainedValue()
+            let keys = changedKeys as? [String] ?? []
+            // La Wi-Fi también es en*, pero su enlace no dice nada de Ethernet.
+            if let wifiKey = me.wifiLinkKey, !keys.isEmpty, keys.allSatisfy({ $0 == wifiKey }) { return }
             me.evaluateWiFiPolicy(forceApply: false)
         }, &context),
-              SCDynamicStoreSetNotificationKeys(store, nil, ["State:/Network/Interface/.*/Link" as CFString] as CFArray),
+              SCDynamicStoreSetNotificationKeys(store, nil, ["State:/Network/Interface/en[0-9]+/Link" as CFString] as CFArray),
               SCDynamicStoreSetDispatchQueue(store, .main) else {
             NSLog("No se pudo suscribir a los cambios de enlace de red")
             return
@@ -315,7 +417,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if wifiPolicyEnabled && (forceApply || linkChanged) {
             setWiFiPower(!ethernet)
         }
-        updateStatusMenu()
+        // Pintar el estado cuesta dos consultas por XPC (bluetoothd y la Wi-Fi), que con
+        // el menú cerrado no ve nadie.
+        if menuIsOpen {
+            updateStatusMenu()
+        }
     }
 
     @objc private func toggleBluetoothPolicy(_ sender: NSMenuItem) {
@@ -378,20 +484,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let wantAggressive = onAC && aggressiveFansEnabled && ProcessInfo.processInfo.thermalState == .nominal
         // Sin nada que cambiar no se lanza el helper: el modo forzado vuelve solo a auto
         // tras dormir, y si nunca lo aplicamos no hay nada que restaurar.
-        if wantAggressive || appliedAggressiveFans {
+        let touchesFans = wantAggressive || appliedAggressiveFans
+        if touchesFans {
+            // En la salida, una sola espera para todos los ventiladores. Con el helper roto
+            // (LWCR obsoleto) no responde nunca, y esperar 3 s por ventilador, uno tras
+            // otro, alargaba la salida a 6,4 s en este Mac (medido el 2026-10-09).
+            let replies: DispatchGroup? = synchronous ? DispatchGroup() : nil
             if wantAggressive {
                 for index in 0..<fanCount {
                     guard let rpm = aggressiveTargetRPM(forFan: index) else { continue }
-                    sendFanCommand(fanIndex: index, forced: true, rpm: rpm, synchronous: synchronous)
+                    sendFanCommand(fanIndex: index, forced: true, rpm: rpm, replies: replies)
                 }
             } else {
                 for index in 0..<fanCount {
-                    sendFanCommand(fanIndex: index, forced: false, rpm: 0, synchronous: synchronous)
+                    sendFanCommand(fanIndex: index, forced: false, rpm: 0, replies: replies)
                 }
             }
+            // Con timeout: si launchd no puede lanzar el helper, una espera sin límite
+            // bloquearía la salida de la app indefinidamente.
+            _ = replies?.wait(timeout: .now() + 3)
             appliedAggressiveFans = wantAggressive
         }
-        guard !synchronous, !isRetry else { return }
+        // Solo se verifica mientras los ventiladores son cosa nuestra: o la política está
+        // activa (que cubre también la recuperación tras un cierre anómalo, porque la
+        // preferencia sobrevive al proceso) o acabamos de escribir algo que pudo perderse.
+        // Con la función sin usar, un ventilador en modo forzado es de otra herramienta y
+        // devolverlo a auto sería pisarla.
+        guard !synchronous, !isRetry, aggressiveFansEnabled || touchesFans else { return }
         scheduleFanPolicyVerification()
     }
 
@@ -401,7 +520,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func aggressiveTargetRPM(forFan index: Int) -> Double? {
         let minimum = "F\(index)Mn".withCString { SMCGetFloatValue($0) }
         let maximum = "F\(index)Mx".withCString { SMCGetFloatValue($0) }
-        guard minimum >= 0, maximum >= 0 else { return nil }
+        guard minimum >= 0, minimum.isFinite, maximum >= 0, maximum.isFinite else { return nil }
         return max(minimum, (Double(fanIntensityPercent) / 100.0) * maximum)
     }
 
@@ -410,23 +529,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // una cola de launchd rota (LWCR obsoleto), un mensaje puede perderse o entregarse
     // tarde y dejar el SMC en un estado que la app cree distinto. F#Md se puede leer
     // sin privilegios, así que se compara la realidad con lo deseado *en este momento*
-    // y se reenvía una sola vez si no cuadra.
+    // y se reenvía una sola vez si no cuadra. Quién la programa y con qué condición está
+    // en applyFanPolicy; aquí no se vuelve a filtrar, porque el caso más importante es
+    // justo el de la política recién apagada (la vuelta a auto pudo perderse).
     private func scheduleFanPolicyVerification() {
         pendingFanVerification += 1
         let generation = pendingFanVerification
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             guard let self, self.pendingFanVerification == generation else { return }
-            let desired = self.lastOnACPower && self.aggressiveFansEnabled
-                && ProcessInfo.processInfo.thermalState == .nominal
-            let mismatch = (0..<self.fanCount).contains { index in
-                let mode = "F\(index)Md".withCString { SMCGetFloatValue($0) }
-                return mode >= 0 && (mode >= 0.5) != desired
-            }
-            guard mismatch else { return }
+            let desired = self.fanPolicyWantsForced
+            guard !self.fansMatchPolicy(forced: desired) else { return }
             NSLog("Estado de ventiladores no coincide con la política (¿mensaje perdido?); reintentando")
             self.appliedAggressiveFans = !desired
             self.applyFanPolicy(onAC: self.lastOnACPower, isRetry: true)
         }
+    }
+
+    private var fanPolicyWantsForced: Bool {
+        lastOnACPower && aggressiveFansEnabled && ProcessInfo.processInfo.thermalState == .nominal
+    }
+
+    // ¿Están los ventiladores como pide la política ahora mismo? F#Md y F#Tg se leen sin
+    // privilegios, así que comprobarlo no lanza el helper. El objetivo cuenta porque un
+    // cambio de intensidad perdido deja el modo bien y las RPM mal. Una lectura fallida
+    // no cuenta como discrepancia: sin dato no se reenvía nada.
+    private func fansMatchPolicy(forced desired: Bool) -> Bool {
+        for index in 0..<fanCount {
+            let mode = "F\(index)Md".withCString { SMCGetFloatValue($0) }
+            guard mode >= 0 else { continue }
+            if (mode >= 0.5) != desired { return false }
+            if desired, let target = aggressiveTargetRPM(forFan: index) {
+                let current = "F\(index)Tg".withCString { SMCGetFloatValue($0) }
+                if current >= 0 && abs(current - target) > 1 { return false }
+            }
+        }
+        return true
     }
 
     private func helperService() -> SMAppService {
@@ -461,13 +598,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let connection = helperXPCConnection()
         let message = xpc_dictionary_create(nil, nil, 0)
         xpc_dictionary_set_int64(message, "fan", -1)
-        xpc_connection_send_message_with_reply(connection, message, DispatchQueue.main) { _ in
-            answered = true
+        xpc_connection_send_message_with_reply(connection, message, DispatchQueue.main) { reply in
+            // Los errores de XPC (servicio inválido, conexión interrumpida) llegan por
+            // este mismo handler: darlos por respuesta dejaba sin reparar buena parte de
+            // los casos rotos, que era justo lo que se quería detectar.
+            if xpc_get_type(reply) != XPC_TYPE_ERROR {
+                answered = true
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
             guard let self, !answered else { return }
-            NSLog("Helper sin respuesta; re-registrando el daemon")
             let service = self.helperService()
+            // Reparar solo tiene sentido si el sistema da el daemon por habilitado y aun
+            // así no contesta, que es la firma del LWCR obsoleto. Si está pendiente de
+            // aprobación o sin registrar, el ciclo unregister/register no arregla nada y
+            // repetiría en cada inicio de sesión el aviso de "elemento en segundo plano
+            // añadido"; ahí basta el ⚠️ del submenú, que se actualiza al abrir el menú.
+            guard service.status == .enabled else { return }
+            NSLog("Helper sin respuesta; re-registrando el daemon")
             try? service.unregister()
             // BTM procesa el des-registro de forma asíncrona: registrar de inmediato
             // puede reciclar el registro viejo con su LWCR obsoleto y quedar "enabled"
@@ -479,7 +627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 } catch {
                     NSLog("Re-registro del helper: \(error)")
                 }
-                self.helperConnection = nil
+                self.discardHelperConnection()
                 self.updateAggressiveFansMenuItem()
                 if service.status == .enabled {
                     self.applyFanPolicy(onAC: self.lastOnACPower)
@@ -498,11 +646,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 2 == XPC_CONNECTION_MACH_SERVICE_PRIVILEGED (macro no importable desde Swift):
         // el servicio vive en el bootstrap privilegiado porque el helper es un daemon.
         let connection = xpc_connection_create_mach_service(Self.helperServiceName, DispatchQueue.main, 2)
+        helperConnectionGeneration += 1
+        let generation = helperConnectionGeneration
         xpc_connection_set_event_handler(connection) { [weak self] event in
-            // Aquí solo llegan errores (helper aún no aprobado, reinstalado…): se descarta
-            // la conexión cacheada para recrearla limpia en el siguiente uso.
+            // Aquí solo llegan errores (helper aún no aprobado, reinstalado, salida por
+            // inactividad…): se descarta la conexión cacheada para recrearla limpia en el
+            // siguiente uso.
             if xpc_get_type(event) == XPC_TYPE_ERROR {
-                self?.helperConnection = nil
+                self?.discardHelperConnection(generation: generation)
             }
         }
         xpc_connection_activate(connection)
@@ -510,21 +661,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return connection
     }
 
-    private func sendFanCommand(fanIndex: Int, forced: Bool, rpm: Double, synchronous: Bool) {
+    // Soltar una conexión activada sin cancelarla deja el objeto y su puerto vivos dentro
+    // de libxpc, así que se cancela siempre. `generation` distingue a la conexión que
+    // avisó del error de la que pueda estar cacheada ya en su lugar.
+    private func discardHelperConnection(generation: Int? = nil) {
+        if let generation, generation != helperConnectionGeneration { return }
+        guard let connection = helperConnection else { return }
+        helperConnection = nil
+        xpc_connection_cancel(connection)
+    }
+
+    // Con `replies`, quien llama espera las respuestas en el grupo (la salida de la app);
+    // sin él, el envío es asíncrono.
+    private func sendFanCommand(fanIndex: Int, forced: Bool, rpm: Double, replies: DispatchGroup?) {
         let connection = helperXPCConnection()
         let message = xpc_dictionary_create(nil, nil, 0)
         xpc_dictionary_set_int64(message, "fan", Int64(fanIndex))
         xpc_dictionary_set_int64(message, "mode", forced ? 1 : 0)
         xpc_dictionary_set_double(message, "rpm", rpm)
-        if synchronous {
-            // Con timeout: si launchd no puede lanzar el helper, una espera síncrona
-            // sin límite bloquearía la salida de la app indefinidamente.
-            let semaphore = DispatchSemaphore(value: 0)
+        if let replies {
+            // Con la cola de respuesta a nil, libxpc no entrega la respuesta en la cola
+            // principal, que en la salida está bloqueada esperando, así que no hay
+            // interbloqueo: comprobado el 2026-10-09, la app sale en 0,28 s con los dos
+            // ventiladores forzados, y vuelven a auto.
+            replies.enter()
             xpc_connection_send_message_with_reply(connection, message, nil) { [weak self] reply in
                 self?.logFanWriteReplyIfFailed(reply, fanIndex: fanIndex)
-                semaphore.signal()
+                replies.leave()
             }
-            _ = semaphore.wait(timeout: .now() + 3)
         } else {
             xpc_connection_send_message_with_reply(connection, message, DispatchQueue.main) { [weak self] reply in
                 self?.logFanWriteReplyIfFailed(reply, fanIndex: fanIndex)
@@ -534,7 +698,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func logFanWriteReplyIfFailed(_ reply: xpc_object_t, fanIndex: Int) {
         if xpc_get_type(reply) == XPC_TYPE_ERROR || xpc_dictionary_get_int64(reply, "status") != 0 {
-            NSLog("No se pudo ajustar el mínimo del ventilador \(fanIndex) (¿helper aprobado en Ajustes?)")
+            NSLog("No se pudo ajustar el ventilador \(fanIndex) (¿helper aprobado en Ajustes?)")
         }
     }
 
@@ -565,29 +729,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var iterator: io_iterator_t = 0
         guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else { return true }
         defer { IOObjectRelease(iterator) }
-        var entry = IOIteratorNext(iterator)
-        while entry != IO_OBJECT_NULL {
-            defer { IOObjectRelease(entry) }
-            var current = entry
-            IOObjectRetain(current)
-            while current != IO_OBJECT_NULL {
-                var className = [CChar](repeating: 0, count: 128)
-                IOObjectGetClass(current, &className)
-                let name = String(cString: className)
-                // Virtuales conocidas: PAN de Bluetooth e iPhone/iPad por USB.
-                if name.contains("Bluetooth") || name == "IOUserEthernetController"
-                    || name.hasPrefix("AppleUSBDeviceNCM") {
-                    IOObjectRelease(current)
-                    return false
-                }
-                var parent: io_registry_entry_t = 0
-                let kr = IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent)
-                IOObjectRelease(current)
-                current = (kr == KERN_SUCCESS) ? parent : IO_OBJECT_NULL
-            }
-            entry = IOIteratorNext(iterator)
+        // Cada servicio se libera aquí mismo, no en un defer: dentro de un bucle, defer
+        // captura la variable y no su valor, así que corría tras el IOIteratorNext del
+        // final y liberaba el objeto siguiente en vez de éste. El nombre de puerto Mach
+        // es el mismo para una entrada dada, de modo que la fuga no se veía como puertos
+        // nuevos sino como referencias acumuladas sobre uno solo, sin techo en una app
+        // residente (esta función corre en cada evento de enlace, por interfaz).
+        var service = IOIteratorNext(iterator)
+        while service != IO_OBJECT_NULL {
+            let virtual = hasVirtualProvider(service)
+            IOObjectRelease(service)
+            if virtual { return false }
+            service = IOIteratorNext(iterator)
         }
         return true
+    }
+
+    // ¿Delata alguna clase de la cadena de providers (empezando por el propio servicio)
+    // una interfaz virtual? No consume la referencia recibida: retiene por su cuenta.
+    private func hasVirtualProvider(_ service: io_registry_entry_t) -> Bool {
+        var current = service
+        IOObjectRetain(current)
+        while current != IO_OBJECT_NULL {
+            var className = [CChar](repeating: 0, count: 128)
+            IOObjectGetClass(current, &className)
+            let name = String(cString: className)
+            // Virtuales conocidas: PAN de Bluetooth e interfaces creadas desde espacio
+            // de usuario (VPN, máquinas virtuales).
+            if name.contains("Bluetooth") || name == "IOUserEthernetController" {
+                IOObjectRelease(current)
+                return true
+            }
+            // Tethering USB de iPhone/iPad: los drivers CDC de red (AppleUSBNCMData y
+            // familia). El nombre de clase por sí solo no vale, porque hay adaptadores
+            // Ethernet USB de terceros que también son CDC, así que se exige además que
+            // el dispositivo USB sea de Apple. idVendor se lee del propio nodo del driver,
+            // donde el USB lo deja copiado, y no buscando hacia arriba: por encima del
+            // dispositivo hay hubs que también son Apple y darían un falso positivo.
+            if name.hasPrefix("AppleUSBNCM") || name.hasPrefix("AppleUSBECM") {
+                let vendor = IORegistryEntryCreateCFProperty(current, "idVendor" as CFString, nil, 0)?
+                    .takeRetainedValue() as? NSNumber
+                if vendor?.intValue == 0x05AC {
+                    IOObjectRelease(current)
+                    return true
+                }
+            }
+            var parent: io_registry_entry_t = 0
+            let kr = IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent)
+            IOObjectRelease(current)
+            current = (kr == KERN_SUCCESS) ? parent : IO_OBJECT_NULL
+        }
+        return false
     }
 
     private func isEthernetConnected() -> Bool {
@@ -619,15 +811,172 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        // No hay notificación del sistema cuando el usuario aprueba el helper en Ajustes;
-        // reaplicar aquí (idempotente y solo si la función está en uso) cubre ese caso
-        // sin recurrir a polling.
-        applyFanPolicy(onAC: lastOnACPower)
+        menuIsOpen = true
+        // No hay notificación del sistema cuando el usuario aprueba el helper en Ajustes, y
+        // hasta entonces los ventiladores siguen en auto; reaplicar al abrir el menú cubre
+        // ese caso sin recurrir a polling. Solo si el SMC no está como debe: reenviar a
+        // ciegas lanzaba el helper root en cada apertura, con los ventiladores ya bien.
+        if hasFans && (aggressiveFansEnabled || appliedAggressiveFans) {
+            let desired = fanPolicyWantsForced
+            if !fansMatchPolicy(forced: desired) {
+                appliedAggressiveFans = !desired
+                applyFanPolicy(onAC: lastOnACPower)
+            }
+        }
         updateAggressiveFansMenuItem()
+        updateKeepAwakeMenuItem()
         updateStatusMenu()
         updateTemperatureMenuItem()
         updateBatteryTemperatureMenuItem()
         updateFanMenuItem()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
+    }
+
+    // MARK: - Evitar el reposo
+
+    // tag -1 = desactivar, 0 = indefinido, n > 0 = n minutos. Elegir otra duración con
+    // una sesión en marcha empieza una nueva desde ahora.
+    @objc private func selectKeepAwake(_ sender: NSMenuItem) {
+        if sender.tag < 0 {
+            stopKeepAwake()
+        } else {
+            startKeepAwake(minutes: sender.tag)
+        }
+    }
+
+    @objc private func toggleKeepAwakeDisplaySleep(_ sender: NSMenuItem) {
+        keepAwakeAllowsDisplaySleep.toggle()
+        // Cambia el tipo de aserción: se suelta la vieja y se crea la nueva.
+        if keepAwakeActive && !createSleepAssertion() {
+            stopKeepAwake()
+        }
+        updateKeepAwakeMenuItem()
+    }
+
+    private func startKeepAwake(minutes: Int) {
+        cancelKeepAwakeTimer()
+        keepAwakeActive = true
+        keepAwakeMinutes = minutes
+        keepAwakeUntil = nil
+        guard createSleepAssertion() else {
+            stopKeepAwake()
+            return
+        }
+        if minutes > 0 {
+            let until = Date().addingTimeInterval(TimeInterval(minutes * 60))
+            keepAwakeUntil = until
+            // Un único disparo al vencer, que se cancela si la sesión acaba antes, así que
+            // no queda ningún despertar pendiente. En tiempo de reloj (wallDeadline): si el
+            // Mac duerme igualmente, por ejemplo al cerrar la tapa, la sesión vence a su
+            // hora y no se alarga lo que haya durado el sueño.
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.schedule(wallDeadline: .now() + .seconds(minutes * 60))
+            timer.setEventHandler { [weak self] in
+                self?.stopKeepAwake()
+            }
+            timer.resume()
+            keepAwakeTimer = timer
+        }
+        updateStatusItemIcon()
+        updateKeepAwakeMenuItem()
+    }
+
+    private func stopKeepAwake() {
+        cancelKeepAwakeTimer()
+        keepAwakeActive = false
+        keepAwakeUntil = nil
+        releaseSleepAssertion()
+        updateStatusItemIcon()
+        updateKeepAwakeMenuItem()
+    }
+
+    private func cancelKeepAwakeTimer() {
+        keepAwakeTimer?.cancel()
+        keepAwakeTimer = nil
+    }
+
+    // Con la pantalla encendida, PreventUserIdleDisplaySleep (caffeinate -d), que ya
+    // impide también el reposo del sistema. Si se permite apagarla, basta con
+    // PreventUserIdleSystemSleep (caffeinate -i). Ninguna de las dos impide el reposo
+    // al cerrar la tapa: para eso haría falta `pmset disablesleep`, que es de root y
+    // persiste si la app muere.
+    private func createSleepAssertion() -> Bool {
+        releaseSleepAssertion()
+        let type = keepAwakeAllowsDisplaySleep ? kIOPMAssertPreventUserIdleSystemSleep : kIOPMAssertPreventUserIdleDisplaySleep
+        var assertionID = IOPMAssertionID(0)
+        let result = IOPMAssertionCreateWithName(type as CFString,
+                                                 IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                                 "PlugPilot: evitar el reposo" as CFString,
+                                                 &assertionID)
+        guard result == kIOReturnSuccess else {
+            NSLog("No se pudo crear la aserción para evitar el reposo: \(result)")
+            return false
+        }
+        sleepAssertionID = assertionID
+        return true
+    }
+
+    private func releaseSleepAssertion() {
+        guard sleepAssertionID != 0 else { return }
+        IOPMAssertionRelease(sleepAssertionID)
+        sleepAssertionID = 0
+    }
+
+    private func keepAwakeDurationTitle(minutes: Int) -> String {
+        if minutes < 60 {
+            return String(format: NSLocalizedString("keepAwake.minutes.format", comment: "Duración en minutos, %d = minutos"), minutes)
+        }
+        if minutes == 60 {
+            return NSLocalizedString("keepAwake.hour", comment: "Duración de una hora")
+        }
+        return String(format: NSLocalizedString("keepAwake.hours.format", comment: "Duración en horas, %d = horas"), minutes / 60)
+    }
+
+    // La hora de fin no envejece con el menú abierto, a diferencia de un «quedan N min»,
+    // que obligaría a refrescarlo con un timer.
+    private func keepAwakeTitle() -> String {
+        guard keepAwakeActive else {
+            return NSLocalizedString("keepAwake.title", comment: "Submenú: evitar el reposo, inactivo")
+        }
+        guard let until = keepAwakeUntil else {
+            return NSLocalizedString("keepAwake.title.indefinite", comment: "Evitar el reposo: activo sin límite de tiempo")
+        }
+        // «Hasta la una» pero «hasta las dos»: el artículo sigue a la hora tal como se lee,
+        // que en formato de 12 horas también es la una a las 13:00.
+        let hour = Calendar.current.component(.hour, from: until)
+        let hourFormat = DateFormatter.dateFormat(fromTemplate: "j", options: 0, locale: .current) ?? "H"
+        let uses12Hours = hourFormat.contains("h") || hourFormat.contains("K")
+        let spokenHour = uses12Hours ? (hour % 12 == 0 ? 12 : hour % 12) : hour
+        let key = spokenHour == 1 ? "keepAwake.title.until.singular.format" : "keepAwake.title.until.format"
+        return String(format: NSLocalizedString(key, comment: "Evitar el reposo: activo hasta una hora, %@ = hora de fin"),
+                      Self.timeFormatter.string(from: until))
+    }
+
+    // El icono relleno avisa de que el Mac no va a dormir solo, como hace Amphetamine.
+    private func updateStatusItemIcon() {
+        statusItem.button?.image = NSImage(
+            systemSymbolName: keepAwakeActive ? "bolt.horizontal.circle.fill" : "bolt.horizontal.circle",
+            accessibilityDescription: keepAwakeActive
+                ? NSLocalizedString("accessibility.keepAwake", comment: "Descripción del icono de la barra mientras se evita el reposo")
+                : "PlugPilot")
+    }
+
+    private func updateKeepAwakeMenuItem() {
+        guard let item = statusItem.menu?.item(withTag: 109), let submenu = item.submenu else { return }
+        item.title = keepAwakeTitle()
+        for subItem in submenu.items where !subItem.isSeparatorItem {
+            switch subItem.tag {
+            case -2:
+                subItem.state = keepAwakeAllowsDisplaySleep ? .on : .off
+            case -1:
+                subItem.state = keepAwakeActive ? .off : .on
+            default:
+                subItem.state = keepAwakeActive && subItem.tag == keepAwakeMinutes ? .on : .off
+            }
+        }
     }
 
     private static let cpuTemperatureKeys = ["TC0P", "TC0D", "TC0E", "TC0F", "TC0H", "TCXC"]
@@ -671,7 +1020,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let readings = (0..<fanCount).map { index -> String in
             let actual = "F\(index)Ac".withCString { SMCGetFloatValue($0) }
             let maximum = "F\(index)Mx".withCString { SMCGetFloatValue($0) }
-            guard actual >= 0, maximum > 0 else {
+            // isFinite: Int(_: Double) es una trampa fatal con infinito, y los valores
+            // vienen del SMC, no de nosotros.
+            guard actual >= 0, actual.isFinite, maximum > 0, maximum.isFinite else {
                 return String(format: NSLocalizedString("fan.reading.unavailable.format", comment: "Lectura de ventilador no disponible, %d = índice"), index)
             }
             let percent = Int((actual / maximum) * 100)
